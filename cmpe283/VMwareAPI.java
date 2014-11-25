@@ -393,13 +393,388 @@ public class VMwareAPI {
 	}
 
 
+	//10. Export OVF
+	public static LeaseProgressUpdater leaseProgUpdater;
+	public void ExportOvfToLocal(String vApporVmName, String hostip, String entityType, String targetDir) throws Exception
+	{
+		HostSystem host = (HostSystem) si.getSearchIndex().findByIp(null, hostip, false); 
+
+		System.out.println("Host Name : " + host.getName());
+		System.out.println("Network : " + host.getNetworks()[0].getName());
+		System.out.println("Datastore : " + host.getDatastores()[0].getName());
+
+		InventoryNavigator iv = new InventoryNavigator(si.getRootFolder());
+
+		HttpNfcLease hnLease = null;
+
+		ManagedEntity me = null;
+		if (entityType.equals("VirtualApp"))
+		{
+			me = iv.searchManagedEntity("VirtualApp", vApporVmName);
+			hnLease = ((VirtualApp)me).exportVApp();
+		}
+		else
+		{
+			me = iv.searchManagedEntity("VirtualMachine", vApporVmName);
+			hnLease = ((VirtualMachine)me).exportVm();
+		}
+
+		// Wait until the HttpNfcLeaseState is ready
+		HttpNfcLeaseState hls;
+		for(;;)
+		{
+			hls = hnLease.getState();
+			if(hls == HttpNfcLeaseState.ready)
+			{
+				break;
+			}
+			if(hls == HttpNfcLeaseState.error)
+			{
+				si.getServerConnection().logout();
+				return;
+			}
+		}
+
+		System.out.println("HttpNfcLeaseState: ready ");
+		HttpNfcLeaseInfo httpNfcLeaseInfo = hnLease.getInfo();
+		httpNfcLeaseInfo.setLeaseTimeout(300*1000*1000);
+		printHttpNfcLeaseInfo1(httpNfcLeaseInfo);
+
+		//Note: the diskCapacityInByte could be many time bigger than
+		//the total size of VMDK files downloaded. 
+		//As a result, the progress calculated could be much less than reality.
+		long diskCapacityInByte = (httpNfcLeaseInfo.getTotalDiskCapacityInKB()) * 1024;
+
+		leaseProgUpdater = new LeaseProgressUpdater(hnLease, 5000);
+		leaseProgUpdater.start();
+
+		long alredyWrittenBytes = 0;
+		HttpNfcLeaseDeviceUrl[] deviceUrls = httpNfcLeaseInfo.getDeviceUrl();
+		if (deviceUrls != null) 
+		{
+			OvfFile[] ovfFiles = new OvfFile[deviceUrls.length];
+			System.out.println("Downloading Files:");
+			for (int i = 0; i < deviceUrls.length; i++) 
+			{
+				String deviceId = deviceUrls[i].getKey();
+				String deviceUrlStr = deviceUrls[i].getUrl();
+				String diskFileName = deviceUrlStr.substring(deviceUrlStr.lastIndexOf("/") + 1);
+				String diskUrlStr = deviceUrlStr.replace("*", hostip);
+				String diskLocalPath = targetDir + diskFileName;
+				System.out.println("File Name: " + diskFileName);
+				System.out.println("VMDK URL: " + diskUrlStr);
+				String cookie = si.getServerConnection().getVimService().getWsc().getCookie();
+				long lengthOfDiskFile = writeVMDKFile(diskLocalPath, diskUrlStr, cookie, alredyWrittenBytes, diskCapacityInByte);
+				alredyWrittenBytes += lengthOfDiskFile;
+				OvfFile ovfFile = new OvfFile();
+				ovfFile.setPath(diskFileName);
+				ovfFile.setDeviceId(deviceId);
+				ovfFile.setSize(lengthOfDiskFile);
+				ovfFiles[i] = ovfFile;
+			}
+
+			OvfCreateDescriptorParams ovfDescParams = new OvfCreateDescriptorParams();
+			ovfDescParams.setOvfFiles(ovfFiles);
+			OvfCreateDescriptorResult ovfCreateDescriptorResult = 
+					si.getOvfManager().createDescriptor(me, ovfDescParams);
+
+			String ovfPath = targetDir + vApporVmName + ".ovf";
+			FileWriter out = new FileWriter(ovfPath);
+			out.write(ovfCreateDescriptorResult.getOvfDescriptor());
+			out.close();
+			System.out.println("OVF Desriptor Written to file: " + ovfPath);
+		} 
+
+		System.out.println("Completed Downloading the files");
+		leaseProgUpdater.interrupt();
+		hnLease.httpNfcLeaseProgress(100);
+		hnLease.httpNfcLeaseComplete();
+
+		si.getServerConnection().logout();
+	}
 
 
+	private static void printHttpNfcLeaseInfo1(HttpNfcLeaseInfo info) 
+	{
+		System.out.println("########################  HttpNfcLeaseInfo  ###########################");
+		System.out.println("Lease Timeout: " + info.getLeaseTimeout());
+		System.out.println("Total Disk capacity: "	+ info.getTotalDiskCapacityInKB());
+		HttpNfcLeaseDeviceUrl[] deviceUrlArr = info.getDeviceUrl();
+		if (deviceUrlArr != null) 
+		{
+			int deviceUrlCount = 1;
+			for (HttpNfcLeaseDeviceUrl durl : deviceUrlArr) 
+			{
+				System.out.println("HttpNfcLeaseDeviceUrl : "
+						+ deviceUrlCount++);
+				System.out.println("	Device URL Import Key: "
+						+ durl.getImportKey());
+				System.out.println("	Device URL Key: " + durl.getKey());
+				System.out.println("	Device URL : " + durl.getUrl());
+				System.out.println("	SSL Thumbprint : "	+ durl.getSslThumbprint());
+			}
+		} 
+		else
+		{
+			System.out.println("No Device URLS Found");
+		}
+	}
+
+	private static long writeVMDKFile(String localFilePath, String diskUrl, String cookie, 
+			long bytesAlreadyWritten, long totalBytes) throws IOException 
+			{
+		HttpsURLConnection conn = getHTTPConnection(diskUrl, cookie);
+		InputStream in = conn.getInputStream();
+		OutputStream out = new FileOutputStream(new File(localFilePath));
+		byte[] buf = new byte[102400];
+		int len = 0;
+		long bytesWritten = 0;
+		while ((len = in.read(buf)) > 0) 
+		{
+			out.write(buf, 0, len);
+			bytesWritten += len;
+			int percent = (int)(((bytesAlreadyWritten + bytesWritten) * 100) / totalBytes);
+			leaseProgUpdater.setPercent(percent);
+			System.out.println("written: " + bytesWritten);
+		}
+		in.close();
+		out.close();
+		return bytesWritten;
+			}
+
+	private static HttpsURLConnection getHTTPConnection(String urlStr, String cookieStr) throws IOException 
+	{
+		HostnameVerifier hv = new HostnameVerifier() 
+		{
+			public boolean verify(String urlHostName, SSLSession session) 
+			{
+				return true;
+			}
+		};
+		HttpsURLConnection.setDefaultHostnameVerifier(hv);
+		URL url = new URL(urlStr);
+		HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+
+		conn.setDoInput(true);
+		conn.setDoOutput(true);
+		conn.setAllowUserInteraction(true);
+		conn.setRequestProperty("Cookie",	cookieStr);
+		conn.connect();
+		return conn;
+	}
+
+	//11. Import OVF
+	private static final int CHUCK_LEN = 64 * 1024;
+	public static LeaseProgressUpdater leaseUpdater;
+	public void ImportLocalOvfVApp(String ovfLocal, String hostipadd, String newVmName) throws Exception 
+	{
+		HostSystem host = (HostSystem) si.getSearchIndex().findByIp(null, hostipadd, false); 
+
+		System.out.println("Host Name : " + host.getName());
+		System.out.println("Network : " + host.getNetworks()[0].getName());
+		System.out.println("Datastore : " + host.getDatastores()[0].getName());
+
+		Folder vmFolder = (Folder) host.getVms()[0].getParent();
+
+		OvfCreateImportSpecParams importSpecParams = new OvfCreateImportSpecParams();
+		importSpecParams.setHostSystem(host.getMOR());
+		importSpecParams.setLocale("US");
+		importSpecParams.setEntityName(newVmName);
+		importSpecParams.setDeploymentOption("");
+		OvfNetworkMapping networkMapping = new OvfNetworkMapping();
+		networkMapping.setName("Network 1");
+		networkMapping.setNetwork(host.getNetworks()[0].getMOR()); // network);
+		importSpecParams.setNetworkMapping(new OvfNetworkMapping[] { networkMapping });
+		importSpecParams.setPropertyMapping(null);
+
+		String ovfDescriptor = readOvfContent(ovfLocal);
+		if (ovfDescriptor == null) 
+		{
+			si.getServerConnection().logout();
+			return;
+		}
+
+		ovfDescriptor = escapeSpecialChars(ovfDescriptor);
+		System.out.println("ovfDesc:" + ovfDescriptor);
+
+		ResourcePool rp = ((ComputeResource)host.getParent()).getResourcePool();
+
+		OvfCreateImportSpecResult ovfImportResult = si.getOvfManager().createImportSpec(
+				ovfDescriptor, rp, host.getDatastores()[0], importSpecParams);
+
+		if(ovfImportResult==null)
+		{
+			si.getServerConnection().logout();
+			return;
+		}
+
+		long totalBytes = addTotalBytes(ovfImportResult);
+		System.out.println("Total bytes: " + totalBytes);
+
+		HttpNfcLease httpNfcLease = null;
+
+		httpNfcLease = rp.importVApp(ovfImportResult.getImportSpec(), vmFolder, host);
+
+		// Wait until the HttpNfcLeaseState is ready
+		HttpNfcLeaseState hls;
+		for(;;)
+		{
+			hls = httpNfcLease.getState();
+			if(hls == HttpNfcLeaseState.ready || hls == HttpNfcLeaseState.error)
+			{
+				break;
+			}
+		}
+
+		if (hls.equals(HttpNfcLeaseState.ready)) 
+		{
+			System.out.println("HttpNfcLeaseState: ready ");
+			HttpNfcLeaseInfo httpNfcLeaseInfo = (HttpNfcLeaseInfo) httpNfcLease.getInfo();
+			printHttpNfcLeaseInfo1(httpNfcLeaseInfo);
+
+			leaseUpdater = new LeaseProgressUpdater(httpNfcLease, 5000);
+			leaseUpdater.start();
+
+			HttpNfcLeaseDeviceUrl[] deviceUrls = httpNfcLeaseInfo.getDeviceUrl();
+
+			long bytesAlreadyWritten = 0;
+			for (HttpNfcLeaseDeviceUrl deviceUrl : deviceUrls) 
+			{
+				String deviceKey = deviceUrl.getImportKey();
+				for (OvfFileItem ovfFileItem : ovfImportResult.getFileItem()) 
+				{
+					if (deviceKey.equals(ovfFileItem.getDeviceId())) 
+					{
+						System.out.println("Import key==OvfFileItem device id: " + deviceKey);
+						String absoluteFile = new File(ovfLocal).getParent() + File.separator + ovfFileItem.getPath();
+						String urlToPost = deviceUrl.getUrl().replace("*", hostipadd);
+						uploadVmdkFile(ovfFileItem.isCreate(), absoluteFile, urlToPost, bytesAlreadyWritten, totalBytes);
+						bytesAlreadyWritten += ovfFileItem.getSize();
+						System.out.println("Completed uploading the VMDK file:" + absoluteFile);
+					}
+				}
+			}
+
+			leaseUpdater.interrupt();
+			httpNfcLease.httpNfcLeaseProgress(100);
+			httpNfcLease.httpNfcLeaseComplete();
+		}
+		si.getServerConnection().logout();
+	}
 
 
+	public static long addTotalBytes(OvfCreateImportSpecResult ovfImportResult)
+	{
+		OvfFileItem[] fileItemArr = ovfImportResult.getFileItem();
 
+		long totalBytes = 0;
+		if (fileItemArr != null) 
+		{
+			for (OvfFileItem fi : fileItemArr) 
+			{
+				printOvfFileItem(fi);
+				totalBytes += fi.getSize();
+			}
+		}
+		return totalBytes;
+	}
 
+	private static void uploadVmdkFile(boolean put, String diskFilePath, String urlStr, 
+			long bytesAlreadyWritten, long totalBytes) throws IOException 
+			{
+		HttpsURLConnection.setDefaultHostnameVerifier(new HostnameVerifier() 
+		{
+			public boolean verify(String urlHostName, SSLSession session) 
+			{
+				return true;
+			}
+		});
 
+		HttpsURLConnection conn = (HttpsURLConnection) new URL(urlStr).openConnection();
+		conn.setDoOutput(true);
+		conn.setUseCaches(false);
+		conn.setChunkedStreamingMode(CHUCK_LEN);
+		conn.setRequestMethod(put? "PUT" : "POST"); // Use a post method to write the file.
+		conn.setRequestProperty("Connection", "Keep-Alive");
+		conn.setRequestProperty("Content-Type",	"application/x-vnd.vmware-streamVmdk");
+		conn.setRequestProperty("Content-Length", Long.toString(new File(diskFilePath).length()));
+
+		BufferedOutputStream bos = new BufferedOutputStream(conn.getOutputStream());
+
+		BufferedInputStream diskis = new BufferedInputStream(new FileInputStream(diskFilePath));
+		int bytesAvailable = diskis.available();
+		int bufferSize = Math.min(bytesAvailable, CHUCK_LEN);
+		byte[] buffer = new byte[bufferSize];
+
+		long totalBytesWritten = 0;
+		while (true) 
+		{
+			int bytesRead = diskis.read(buffer, 0, bufferSize);
+			if (bytesRead == -1) 
+			{
+				System.out.println("Total bytes written: " + totalBytesWritten);
+				break;
+			}
+
+			totalBytesWritten += bytesRead;
+			bos.write(buffer, 0, bufferSize);
+			bos.flush();
+			System.out.println("Total bytes written: " + totalBytesWritten);
+			int progressPercent = (int) (((bytesAlreadyWritten + totalBytesWritten) * 100) / totalBytes);
+			leaseUpdater.setPercent(progressPercent);			
+		}
+
+		diskis.close();
+		bos.flush();
+		bos.close();
+		conn.disconnect();
+			}
+
+	public static String readOvfContent(String ovfFilePath)	throws IOException 
+	{
+		StringBuffer strContent = new StringBuffer();
+		BufferedReader in = new BufferedReader(new InputStreamReader(new FileInputStream(ovfFilePath)));
+		String lineStr;
+		while ((lineStr = in.readLine()) != null) 
+		{
+			strContent.append(lineStr);
+		}
+		in.close();
+		return strContent.toString();
+	}
+
+	private static void printHttpNfcLeaseInfo(HttpNfcLeaseInfo info) 
+	{
+		System.out.println("================ HttpNfcLeaseInfo ================");
+		HttpNfcLeaseDeviceUrl[] deviceUrlArr = info.getDeviceUrl();
+		for (HttpNfcLeaseDeviceUrl durl : deviceUrlArr) 
+		{
+			System.out.println("Device URL Import Key: " + durl.getImportKey());
+			System.out.println("Device URL Key: " + durl.getKey());
+			System.out.println("Device URL : " + durl.getUrl());
+			System.out.println("Updated device URL: " + durl.getUrl());
+		}
+		System.out.println("Lease Timeout: " + info.getLeaseTimeout());
+		System.out.println("Total Disk capacity: " + info.getTotalDiskCapacityInKB());
+		System.out.println("==================================================");
+	}
+
+	private static void printOvfFileItem(OvfFileItem fi) 
+	{
+		System.out.println("================ OvfFileItem ================");
+		System.out.println("chunkSize: " + fi.getChunkSize());
+		System.out.println("create: " + fi.isCreate());
+		System.out.println("deviceId: " + fi.getDeviceId());
+		System.out.println("path: " + fi.getPath());
+		System.out.println("size: " + fi.getSize());
+		System.out.println("==============================================");
+	}
+
+	public static String escapeSpecialChars(String str)
+	{
+		str = str.replaceAll("<", "&lt;");
+		return str.replaceAll(">", "&gt;"); // do not escape "&" -> "&amp;", "\"" -> "&quot;"
+	}
 
 
 
